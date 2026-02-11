@@ -172,6 +172,118 @@ def make_fwd_bwd_funcs_te(x, w, group_lens, activation_dtype, return_dw_stacked=
     return fwd_func_te, bwd_func_te
 
 
+from aiter.ops.triton.gmm import ptgmm
+from aiter.ops.triton._triton_kernels.gmm import gmm_kernel, get_config
+
+
+def aiter_gmm_forward(x: torch.Tensor, w: torch.Tensor, group_lens: torch.Tensor) -> torch.Tensor:
+    B, N, K = w.shape
+    sumL, N2 = x.shape
+
+    group_sizes = group_lens.to(torch.int32)
+
+    out = torch.empty((sumL, N), device=x.device, dtype=x.dtype)
+
+    cfg = get_config("gmm", M=sumL, K=K, N=N, G=B, accumulate=False)
+
+    BS_M = min(int(cfg.get("BLOCK_SIZE_M", 128)), 128)
+    BS_N = min(int(cfg.get("BLOCK_SIZE_N", 128)), 128)
+    BS_K = min(int(cfg.get("BLOCK_SIZE_K", 32)), 32)
+    GROUP_SIZE = int(cfg.get("GROUP_SIZE", 1))
+    GRID_DIM   = int(cfg.get("GRID_DIM", 240))
+
+    num_warps  = int(cfg.get("NUM_WARPS", 8))
+    num_stages = min(int(cfg.get("NUM_STAGES", 3)), 3)
+
+    grid = (GRID_DIM,)
+
+    gmm_kernel[grid](
+        x, w, group_sizes, out,
+        None,                 # bias_ptr
+        sumL, K, N, B,
+        TRANS_RHS=True,
+        BLOCK_SIZE_M=BS_M,
+        BLOCK_SIZE_K=BS_K,
+        BLOCK_SIZE_N=BS_N,
+        GROUP_SIZE=GROUP_SIZE,
+        GRID_DIM=GRID_DIM,
+        USE_BIAS=False,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return out
+
+
+def aiter_gmm_dx(grad_y: torch.Tensor, w: torch.Tensor, group_lens: torch.Tensor) -> torch.Tensor:
+    B, N, K = w.shape
+    sumL, N2 = grad_y.shape
+
+    group_sizes = group_lens.to(torch.int32)
+
+    dx = torch.empty((sumL, K), device=grad_y.device, dtype=grad_y.dtype)
+
+    cfg = get_config("gmm", M=sumL, K=N, N=K, G=B, accumulate=False) or {}
+
+    BS_M = int(cfg.get("BLOCK_SIZE_M", 128))
+    BS_K = int(cfg.get("BLOCK_SIZE_K", 64))
+    BS_N = int(cfg.get("BLOCK_SIZE_N", 128))
+    GROUP_SIZE = int(cfg.get("GROUP_SIZE", 1))
+    GRID_DIM = int(cfg.get("GRID_DIM", 240))
+
+    grid = (GRID_DIM,)
+
+    gmm_kernel[grid](
+        grad_y, w, group_sizes, dx,
+        None,
+        sumL, N, K, B,
+        TRANS_RHS=False,
+        BLOCK_SIZE_M=BS_M,
+        BLOCK_SIZE_K=BS_K,
+        BLOCK_SIZE_N=BS_N,
+        GROUP_SIZE=GROUP_SIZE,
+        GRID_DIM=GRID_DIM,
+        USE_BIAS=False,
+        num_warps=int(cfg.get("NUM_WARPS", 8)),
+        num_stages=min(int(cfg.get("NUM_STAGES", 3)), 3),
+    )
+    return dx
+
+
+def aiter_ptgmm_dw(x: torch.Tensor, grad_y: torch.Tensor, group_lens: torch.Tensor) -> torch.Tensor:
+    sumL, K = x.shape
+    sumL2, N = grad_y.shape
+
+    group_sizes = group_lens.to(torch.int32)
+
+    dw = torch.empty((group_sizes.numel(), N, K), device=x.device, dtype=x.dtype)
+
+    ptgmm(
+        lhs=grad_y.t(),
+        rhs=x,
+        group_sizes=group_sizes,
+        preferred_element_type=x.dtype,
+        existing_out=dw,
+        config=None,
+        bias_grad=None,
+        accumulate=False,
+    )
+    return dw
+
+
+class GroupedGemmAiter(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, w, group_lens):
+        ctx.save_for_backward(x, w, group_lens)
+        return aiter_gmm_forward(x, w, group_lens)
+
+    @staticmethod
+    def backward(ctx, grad_y):
+        x, w, group_lens = ctx.saved_tensors
+        dx = aiter_gmm_dx(grad_y, w, group_lens)
+        dw = aiter_ptgmm_dw(x, grad_y, group_lens)
+        return dx, dw, None
+
+
 def bench_grouped_gemm(B, M, N, K, dtype):
     device = "cuda"
     # Prepare inputs
@@ -219,6 +331,21 @@ def bench_grouped_gemm(B, M, N, K, dtype):
     torch.testing.assert_close(dx_te, x_ref.grad, **get_tolerances(dtype))
     torch.testing.assert_close(dw_te, w_ref.grad, **get_tolerances(dtype))
 
+    # Aiter Grouped GEMM
+    x_ai = x.clone().detach().requires_grad_()
+    w_ai = w.clone().detach().requires_grad_()
+
+    fwd_func_aiter = lambda: GroupedGemmAiter.apply(x_ai, w_ai, group_lens)
+    out_aiter = fwd_func_aiter()
+
+    bwd_func_aiter = lambda: out_aiter.backward(grad_out, retain_graph=True)
+    bwd_func_aiter()
+
+    # Check Aiter
+    torch.testing.assert_close(out_aiter, out_ref, **get_tolerances(dtype))
+    torch.testing.assert_close(x_ai.grad, x_ref.grad, **get_tolerances(dtype))
+    torch.testing.assert_close(w_ai.grad, w_ref.grad, **get_tolerances(dtype))
+
     # Compute SNRs
     out_snr = compute_snr(out_ref, out)
     if out_snr <= 20:
@@ -253,6 +380,10 @@ def bench_grouped_gemm(B, M, N, K, dtype):
 
         fwd_func_ref()
         bwd_func_ref()
+
+        fwd_func_aiter()
+        bwd_func_aiter()
+
     torch.cuda.synchronize()
 
     # Benchmark
@@ -299,6 +430,18 @@ def bench_grouped_gemm(B, M, N, K, dtype):
     fwd_te_tflops2 = fwd_total_flops / (fwd_te_time_ms2 * 1e-3) / 1e12
     bwd_te_tflops2 = bwd_total_flops / (bwd_te_time_ms2 * 1e-3) / 1e12
 
+    aiter_fwd_timer = benchmark.Timer(stmt="fn()", globals={"fn": fwd_func_aiter})
+    aiter_bwd_timer = benchmark.Timer(stmt="fn()", globals={"fn": bwd_func_aiter})
+
+    aiter_fwd_ms = aiter_fwd_timer.timeit(100)
+    aiter_bwd_ms = aiter_bwd_timer.timeit(100)
+
+    aiter_fwd_ms = aiter_fwd_ms.mean * 1e3
+    aiter_bwd_ms = aiter_bwd_ms.mean * 1e3
+
+    aiter_fwd_tflops = fwd_total_flops / (aiter_fwd_ms * 1e-3) / 1e12
+    aiter_bwd_tflops = bwd_total_flops / (aiter_bwd_ms * 1e-3) / 1e12
+
     fwd_measurement = fwd_timer.timeit(100)
     bwd_measurement = bwd_timer.timeit(100)
     fwd_ref_measurement = fwd_ref_timer.timeit(100)
@@ -325,8 +468,10 @@ def bench_grouped_gemm(B, M, N, K, dtype):
     print(f"TE (non-grouped) Forward  Mean time: {fwd_te_time_ms2:.3f} ms | TFLOPS: {fwd_te_tflops2:.2f}")
     print(f"TE (non-grouped) Backward Mean time: {bwd_te_time_ms2:.3f} ms | TFLOPS: {bwd_te_tflops2:.2f}")
 
+    print(f"Aiter-Triton Forward  Mean time: {aiter_fwd_ms:.3f} ms | TFLOPS: {aiter_fwd_tflops:.2f}")
+    print(f"Aiter-Triton Backward Mean time: {aiter_bwd_ms:.3f} ms | TFLOPS: {aiter_bwd_tflops:.2f}")
 
-    return fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, fwd_ref_time_ms, fwd_ref_tflops, bwd_ref_time_ms, bwd_ref_tflops, fwd_te_time_ms, fwd_te_tflops, bwd_te_time_ms, bwd_te_tflops, fwd_te_time_ms2, fwd_te_tflops2, bwd_te_time_ms2, bwd_te_tflops2
+    return fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, fwd_ref_time_ms, fwd_ref_tflops, bwd_ref_time_ms, bwd_ref_tflops, fwd_te_time_ms, fwd_te_tflops, bwd_te_time_ms, bwd_te_tflops, fwd_te_time_ms2, fwd_te_tflops2, bwd_te_time_ms2, bwd_te_tflops2, aiter_fwd_ms, aiter_fwd_tflops, aiter_bwd_ms, aiter_bwd_tflops
 
 
 if __name__ == "__main__":
@@ -365,6 +510,10 @@ if __name__ == "__main__":
             "TE (non-grouped) Forward TFLOPS",
             "TE (non-grouped) Backward Time (ms)",
             "TE (non-grouped) Backward TFLOPS",
+            "Aiter-Triton Forward Time (ms)",
+            "Aiter-Triton Forward TFLOPS",
+            "Aiter-Triton Backward Time (ms)",
+            "Aiter-Triton Backward TFLOPS",
         ]
     )
     test_id = 0
@@ -408,7 +557,8 @@ if __name__ == "__main__":
                 bwd_ref_time_ms,
                 bwd_ref_tflops,
                 fwd_te_time_ms, fwd_te_tflops, bwd_te_time_ms, bwd_te_tflops,
-                fwd_te_time_ms2, fwd_te_tflops2, bwd_te_time_ms2, bwd_te_tflops2
+                fwd_te_time_ms2, fwd_te_tflops2, bwd_te_time_ms2, bwd_te_tflops2,
+                aiter_fwd_ms, aiter_fwd_tflops, aiter_bwd_ms, aiter_bwd_tflops,
             ) = bench_grouped_gemm(
                 B=B,
                 M=M,
@@ -442,6 +592,10 @@ if __name__ == "__main__":
                 "TE (non-grouped) Forward TFLOPS": f"{fwd_te_tflops2:.2f}",
                 "TE (non-grouped) Backward Time (ms)": f"{bwd_te_time_ms2:.2f}",
                 "TE (non-grouped) Backward TFLOPS": f"{bwd_te_tflops2:.2f}",
+                "Aiter-Triton Forward Time (ms)": f"{aiter_fwd_ms:.2f}",
+                "Aiter-Triton Forward TFLOPS": f"{aiter_fwd_tflops:.2f}",
+                "Aiter-Triton Backward Time (ms)": f"{aiter_bwd_ms:.2f}",
+                "Aiter-Triton Backward TFLOPS": f"{aiter_bwd_tflops:.2f}",
             }
             results = pd.concat([results, pd.DataFrame([new_row])], ignore_index=True)
 

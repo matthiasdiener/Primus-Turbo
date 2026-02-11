@@ -13,18 +13,6 @@ import matplotlib.pyplot as plt
 FWD_BASELINE = "Pytorch grouped Forward TFLOPS"
 BWD_BASELINE = "Pytorch grouped Backward TFLOPS"
 
-FWD_IMPLS = {
-    "Primus-Turbo": "Primus-Turbo Forward TFLOPS",
-    "TE (CK_Tile)": "TE (CK_Tile) Forward TFLOPS",
-    "TE (non-grouped)": "TE (non-grouped) Forward TFLOPS",
-}
-
-BWD_IMPLS = {
-    "Primus-Turbo": "Primus-Turbo Backward TFLOPS",
-    "TE (CK_Tile)": "TE (CK_Tile) Backward TFLOPS",
-    "TE (non-grouped)": "TE (non-grouped) Backward TFLOPS",
-}
-
 
 def _ensure_numeric(df: pd.DataFrame) -> pd.DataFrame:
     for c in df.columns:
@@ -57,6 +45,19 @@ def _pareto_summary(speed: pd.DataFrame) -> pd.DataFrame:
         }
     return pd.DataFrame(stats).loc[["median", "p10", "p90", "min", "max"]]
 
+
+def _discover_impl_columns(df: pd.DataFrame, baseline_col: str, suffix: str) -> dict:
+    impls = {}
+    for c in df.columns:
+        if not c.endswith(suffix):
+            continue
+        if c == baseline_col:
+            continue
+        impl_name = c[: -len(suffix)]
+        impls[impl_name] = c
+    return impls
+
+
 def _compute_speedup(df: pd.DataFrame, baseline_col: str, impls: dict) -> pd.DataFrame:
     out = pd.DataFrame({"Label": df["Label"]})
     for impl_name, col in impls.items():
@@ -83,25 +84,39 @@ def main():
     df = pd.read_csv(csv_path)
     df = _ensure_numeric(df)
 
-    # Validate columns
-    need = [FWD_BASELINE, BWD_BASELINE] + list(FWD_IMPLS.values()) + list(BWD_IMPLS.values())
-    missing = [c for c in need if c not in df.columns]
-    if missing:
-        raise RuntimeError(f"Missing required columns:\n  " + "\n  ".join(missing))
+    # Validate baselines
+    missing_baselines = [c for c in [FWD_BASELINE, BWD_BASELINE] if c not in df.columns]
+    if missing_baselines:
+        raise RuntimeError(
+            "Missing required baseline columns:\n  " + "\n  ".join(missing_baselines)
+        )
+
+    # Discover impls from CSV
+    fwd_impls = _discover_impl_columns(df, FWD_BASELINE, " Forward TFLOPS")
+    bwd_impls = _discover_impl_columns(df, BWD_BASELINE, " Backward TFLOPS")
+
+    if not fwd_impls and not bwd_impls:
+        raise RuntimeError(
+            "No implementation TFLOPS columns found besides baselines. "
+            "Expected columns like '<Impl> Forward TFLOPS' / '<Impl> Backward TFLOPS'."
+        )
 
     df["Label"] = _make_labels(df)
 
     # Compute speedups vs PyTorch
-    fwd_speed = _compute_speedup(df, FWD_BASELINE, FWD_IMPLS)
-    bwd_speed = _compute_speedup(df, BWD_BASELINE, BWD_IMPLS)
+    fwd_speed = _compute_speedup(df, FWD_BASELINE, fwd_impls)
+    bwd_speed = _compute_speedup(df, BWD_BASELINE, bwd_impls)
 
-    # Sort rows using requested impl
+    # Choose a sort reference (prefer forward if available, else backward)
     sort_key = args.sort_by
-    if sort_key in fwd_speed.columns:
-        order = fwd_speed.sort_values(sort_key, ascending=args.ascending).index
+    sort_ref = fwd_speed if fwd_speed is not None else bwd_speed
+
+    if sort_ref is not None and sort_key in sort_ref.columns:
+        order = sort_ref.sort_values(sort_key, ascending=args.ascending).index
         fwd_speed = fwd_speed.loc[order]
         bwd_speed = bwd_speed.loc[order]
     else:
+        # If requested sort key not found, keep CSV order
         pass
 
     # Optional cap
@@ -110,17 +125,19 @@ def main():
         bwd_speed = bwd_speed.iloc[: args.max_rows]
 
     # Figure layout: two heatmaps (forward + backward)
-    nrows = len(fwd_speed.index)
-    # Scale height with #rows so all ylabels can be drawn
-    fig_w = 15.0
+    panels = []
+    panels.append(("Forward speedup vs PyTorch grouped", fwd_speed))
+    panels.append(("Backward speedup vs PyTorch grouped", bwd_speed))
+
+    n_panels = len(panels)
+    nrows = len(panels[0][1].index) if n_panels else 0
+
+    fig_w = 7.5 * n_panels if n_panels else 10.0
     fig_h = max(8.0, 0.24 * nrows)
 
     sns.set_theme(style="white", context="talk")
     fig = plt.figure(figsize=(fig_w, fig_h))
-
-    gs = fig.add_gridspec(nrows=1, ncols=2, wspace=1.25)
-    ax_fwd = fig.add_subplot(gs[0, 0])
-    ax_bwd = fig.add_subplot(gs[0, 1])
+    gs = fig.add_gridspec(nrows=1, ncols=n_panels, wspace=1.25)
 
     def heatmap(ax, data, title):
         vmin = float(np.nanmin(data.to_numpy()))
@@ -155,9 +172,9 @@ def main():
 
         ax.tick_params(axis="x", labelsize=10)
 
-    heatmap(ax_fwd, fwd_speed, "Forward speedup vs PyTorch grouped")
-    heatmap(ax_bwd, bwd_speed, "Backward speedup vs PyTorch grouped")
-
+    for i, (title, data) in enumerate(panels):
+        ax = fig.add_subplot(gs[0, i])
+        heatmap(ax, data, title)
 
     # Output
     if args.output:
