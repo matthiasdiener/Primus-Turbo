@@ -457,10 +457,10 @@ def bench_grouped_gemm(B, M, N, K, dtype):
     fwd_ref_tflops = fwd_total_flops / (fwd_ref_time_ms * 1e-3) / 1e12
     bwd_ref_tflops = bwd_total_flops / (bwd_ref_time_ms * 1e-3) / 1e12
 
-    print(f"Forward  Mean time: {fwd_time_ms:.3f} ms | TFLOPS: {fwd_tflops:.2f}")
-    print(f"Backward Mean time: {bwd_time_ms:.3f} ms | TFLOPS: {bwd_tflops:.2f}")
-    print(f"Ref Forward  Mean time: {fwd_ref_time_ms:.3f} ms | TFLOPS: {fwd_ref_tflops:.2f}")
-    print(f"Ref Backward Mean time: {bwd_ref_time_ms:.3f} ms | TFLOPS: {bwd_ref_tflops:.2f}")
+    print(f"Primus-Turbo Forward  Mean time: {fwd_time_ms:.3f} ms | TFLOPS: {fwd_tflops:.2f}")
+    print(f"Primus-Turbo Backward Mean time: {bwd_time_ms:.3f} ms | TFLOPS: {bwd_tflops:.2f}")
+    print(f"Pytorch grouped Forward  Mean time: {fwd_ref_time_ms:.3f} ms | TFLOPS: {fwd_ref_tflops:.2f}")
+    print(f"Pytorch grouped Backward Mean time: {bwd_ref_time_ms:.3f} ms | TFLOPS: {bwd_ref_tflops:.2f}")
 
     print(f"TE (CK_Tile) Forward  Mean time: {fwd_te_time_ms:.3f} ms | TFLOPS: {fwd_te_tflops:.2f}")
     print(f"TE (CK_Tile) Backward Mean time: {bwd_te_time_ms:.3f} ms | TFLOPS: {bwd_te_tflops:.2f}")
