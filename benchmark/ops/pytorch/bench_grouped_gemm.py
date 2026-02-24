@@ -114,28 +114,22 @@ def make_fwd_bwd_funcs_te(x, w, group_lens, activation_dtype, return_dw_stacked=
         )
         return out
 
-    # Backward buffers
-    grad_splits = [None] * B
-
     # dx buffers
     dx = torch.empty((sum_M, K), device=x.device, dtype=activation_dtype)
     dxs = list(torch.split(dx, m_splits))
 
     # dw buffers
-    dws = [torch.empty((N, K), device=x.device, dtype=activation_dtype) for _ in range(B)]
-    dw_stacked = torch.empty((B, N, K), device=x.device, dtype=activation_dtype) if return_dw_stacked else None
+    dw_stacked = torch.empty((B, N, K), device=x.device, dtype=activation_dtype)
+    dws = [dw_stacked[i] for i in range(B)]
 
     def bwd_func_te(grad_out):
-        go = grad_out.contiguous().view(-1, grad_out.shape[-1])
-        assert go.shape[0] == sum_M and go.shape[1] == N
+        go = grad_out.view(-1, grad_out.shape[-1])
 
         splits = torch.split(go, m_splits)
-        for i in range(B):
-            grad_splits[i] = splits[i]
 
         general_grouped_gemm(
             A=weights,
-            B=grad_splits,
+            B=splits,
             out=dxs,
             out_dtype=activation_dtype,
             workspaces=workspaces,
@@ -149,7 +143,7 @@ def make_fwd_bwd_funcs_te(x, w, group_lens, activation_dtype, return_dw_stacked=
 
         general_grouped_gemm(
             A=xs,
-            B=grad_splits,
+            B=splits,
             out=dws,
             out_dtype=activation_dtype,
             workspaces=workspaces,
@@ -162,12 +156,7 @@ def make_fwd_bwd_funcs_te(x, w, group_lens, activation_dtype, return_dw_stacked=
             accumulate=False,
         )
 
-        if return_dw_stacked:
-            for i in range(B):
-                dw_stacked[i].copy_(dws[i])
-            return dx, dw_stacked
-        else:
-            return dx, dws
+        return dx, dw_stacked if return_dw_stacked else dws
 
     return fwd_func_te, bwd_func_te
 
